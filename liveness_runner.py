@@ -25,10 +25,13 @@ OUTPUTS (in --out)
     failures_log.csv    append-only log of every failure (with image URL)
     run.log             full log
     manifest.json       input file fingerprint, used to refuse unsafe resumes
+    images/             every downloaded image, named <row_number>_<riderId>.<ext>
+                        (disable with --no-save-images)
 
 ALERTS (emailed to ALERT_EMAIL_TO, CC ALERT_EMAIL_CC — defaults below)
     - batch finished: summary of status counts, duration, output folder
-    - writer failure: results can't be written (disk full etc.) — the run stops immediately
+    - disk failure: results or images can't be written, or free space drops below
+      DISK_STOP_MB during the run — the run stops immediately
     - stopped unexpectedly: SIGTERM, SIGHUP (e.g. SSH dropped outside tmux), or an unhandled
       error.
     - stopped manually: Ctrl-C (SIGINT)
@@ -54,7 +57,7 @@ STATUSES
                        JPEG/PNG/WEBP that fails to decode (truncated, damaged)
 
 Exit codes: 0 done, 130 interrupted (resume with same command), 2 aborted at pre-flight,
-3 writer failure (alert sent).
+3 disk/write failure (alert sent).
 
 Requires: python3.8+, `pip install requests pillow` (pillow optional but recommended).
 """
@@ -98,7 +101,9 @@ DEFAULT_API_URL = "https://global.rl.hyperverge.co/v1/checkLiveness"
 ALERT_EMAIL_TO = os.environ.get("ALERT_EMAIL_TO", "s.aravindaan@gmail.com")
 ALERT_EMAIL_CC = os.environ.get("ALERT_EMAIL_CC", "aravindaan.s@hyperverge.co, eshaan.j@hyperverge.co")
 ALERT_RECIPIENTS = ", ".join(x for x in (ALERT_EMAIL_TO, ALERT_EMAIL_CC) if x)
-MIN_FREE_DISK_MB = 500
+MIN_FREE_DISK_MB = 500   # required at startup (plus room for images)
+DISK_STOP_MB = 200       # stop the run if free space falls below this mid-run
+ASSUMED_IMAGE_KB = 400   # used for the disk estimate when no sample was downloaded
 FORM_FIELDS = {
     "returnCroppedImageURL": "no",
     "qualityChecks.eyesClosed": "yes",
@@ -114,7 +119,7 @@ QC_FIELDS = ["value", "score", "confidence"]
 
 BASE_COLS = [
     "run_id", "row_uid", "row_number", "riderId", "transactionId", "status",
-    "http_status", "attempts", "api_latency_ms", "image_bytes", "error_message",
+    "http_status", "attempts", "api_latency_ms", "image_bytes", "saved_image_path", "error_message",
     "started_at", "finished_at",
 ]
 RESPONSE_COLS = (
@@ -438,6 +443,25 @@ def validate_image(data, max_bytes):
     return None, "", (ext, mime)
 
 
+SAVE_EXT = {"JPEG": "jpg", "PNG": "png", "WEBP": "webp", "HEIC/HEIF": "heic", "AVIF": "avif",
+            "GIF": "gif", "BMP": "bmp", "TIFF": "tif", "PDF": "pdf"}
+
+
+def save_image(ctx, item, data):
+    """Write the downloaded bytes to <out>/images/. Atomic: a crash never leaves a half file.
+    Returns the path relative to the output folder."""
+    fmt = sniff_format(data)
+    ext = SAVE_EXT.get(fmt[0], "bin") if fmt else "bin"
+    rider = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in item["riderId"])[:80]
+    name = f"{int(item['row_number']):06d}_{rider or item['row_uid'][:8]}.{ext}"
+    final = ctx.images_dir / name
+    tmp = final.with_name(final.name + ".part")
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, final)
+    return f"images/{name}"
+
+
 _warned_unknown = set()
 _warned_lock = threading.Lock()
 
@@ -561,6 +585,12 @@ def process(item, session, ctx):
         data = download(session, url, ctx)
     except DownloadError as e:
         return done(e.status, {"error_message": str(e)})
+    if ctx.args.save_images and data:
+        try:
+            base["saved_image_path"] = save_image(ctx, item, data)
+        except OSError as e:
+            fatal_stop(ctx, "could not save image", e)
+            raise Aborted()
     bad, msg, kind = validate_image(data, ctx.args.max_image_mb * 1024 * 1024)
     if bad:
         return done(bad, {"error_message": msg, "image_bytes": len(data)})
@@ -667,20 +697,23 @@ def summary_lines(counts, total_rows, run_done, run_by_status, codes, elapsed):
 
 # --------------------------------------------------------------------------- writer / progress
 
-def writer_loop(ctx):
-    try:
-        _writer_body(ctx)
-    except BaseException as e:
-        ctx.writer_error = f"{type(e).__name__}: {e}"
-        ctx.stop.set()
-        log.critical("WRITER FAILED — stopping the run: %s", ctx.writer_error)
-        done, by_status, _, _ = ctx.stats.snapshot()
-        send_alert(
-            f"[liveness-runner] STOPPED: cannot write results ({ctx.args.input})",
-            "\n".join([
-                "The liveness batch run stopped because results could not be written.",
+def fatal_stop(ctx, what, err):
+    """Stop the whole run because output can't be written; alert once."""
+    with ctx.fatal_lock:
+        if ctx.writer_error:
+            return
+        ctx.writer_error = f"{what}: {err if isinstance(err, str) else f'{type(err).__name__}: {err}'}"
+    ctx.stop.set()
+    log.critical("DISK/WRITE FAILURE — stopping the run: %s", ctx.writer_error)
+    done, by_status, _, _ = ctx.stats.snapshot()
+    free = shutil.disk_usage(ctx.out).free / 1048576
+    send_alert(
+        f"[liveness-runner] STOPPED: cannot write to disk ({RUN_INFO.get('batch', '')})",
+        "\n".join([
+                "The liveness batch run stopped because output could not be written.",
                 "",
                 f"Error:      {ctx.writer_error}",
+                f"Free disk:  {free:.0f} MB",
                 f"Host:       {socket.gethostname()}",
                 f"Input:      {Path(ctx.args.input).resolve()}",
                 f"Output dir: {ctx.out.resolve()}",
@@ -690,8 +723,15 @@ def writer_loop(ctx):
                 "",
                 "No API calls are being made now. Fix the cause (e.g. free disk space), then",
                 "resume with the same command; already-written rows will be skipped.",
-            ]),
-        )
+        ]),
+    )
+
+
+def writer_loop(ctx):
+    try:
+        _writer_body(ctx)
+    except BaseException as e:
+        fatal_stop(ctx, "could not write results", e)
 
 
 def _writer_body(ctx):
@@ -729,14 +769,19 @@ def _writer_body(ctx):
 def progress_loop(ctx, every):
     t0 = time.monotonic()
     while not ctx.progress_stop.wait(every):
+        free_mb = shutil.disk_usage(ctx.out).free / 1048576
+        if free_mb < DISK_STOP_MB:
+            fatal_stop(ctx, "low disk space", f"only {free_mb:.0f} MB free (stop threshold {DISK_STOP_MB} MB)")
+            return
         done, by_status, calls_60s, _ = ctx.stats.snapshot()
         remaining = ctx.stats.total - done
         target = ctx.limiter.rpm
         eta = remaining * 60.0 / max(target, 1)
         fails = {k: v for k, v in by_status.items() if k != SUCCESS}
-        log.info("[progress] %d/%d (%.1f%%) | API calls last 60s: %d (target %d RPM) | ok %d | fail %s | elapsed %s | ETA ~%s",
+        log.info("[progress] %d/%d (%.1f%%) | API calls last 60s: %d (target %d RPM) | ok %d | fail %s | elapsed %s | ETA ~%s | disk free %.1f GB",
                  done, ctx.stats.total, 100.0 * done / max(ctx.stats.total, 1), calls_60s, target,
-                 by_status.get(SUCCESS, 0), fails or 0, fmt_dur(time.monotonic() - t0), fmt_dur(eta))
+                 by_status.get(SUCCESS, 0), fails or 0, fmt_dur(time.monotonic() - t0), fmt_dur(eta),
+                 free_mb / 1024)
 
 
 def finalize(out):
@@ -804,6 +849,8 @@ def parse_args():
     p.add_argument("--download-retries", type=int, default=3)
     p.add_argument("--download-timeout", type=float, default=30.0)
     p.add_argument("--max-image-mb", type=float, default=10.0)
+    p.add_argument("--no-save-images", dest="save_images", action="store_false",
+                   help="don't save downloaded images to <out>/images/")
     p.add_argument("--retry-failed", action="store_true", help="also re-run rows whose latest status is retriable")
     p.add_argument("--limit", type=int, help="process at most N pending rows (test runs)")
     p.add_argument("--progress-every", type=float, default=30.0, help="seconds")
@@ -887,6 +934,12 @@ def main():
                                          "created": now_iso()}, indent=2))
 
     rpath = out / "results.csv"
+    if rpath.exists() and rpath.stat().st_size:
+        with open(rpath, newline="", encoding="utf-8") as f:
+            header = next(csv.reader(f), [])
+        if header != RESULT_COLS:
+            raise SystemExit(f"{rpath} was written by a different version of this script (columns differ). "
+                             f"Use a new --out folder for this run.")
     repair_partial_line(rpath)
     repair_partial_line(out / "failures_log.csv")
     latest = load_latest(rpath)
@@ -916,6 +969,7 @@ def main():
              " -> ".join(map(str, limiter.levels)), a.step_interval, fmt_dur(proj), fmt_ts(finish))
 
     # ---- pre-flight
+    sample_sizes = []
     if not a.skip_preflight:
         exps = [(url_expiry(r["image"]), r) for r in pending if r["image"]]
         known = [e for e, _ in exps if e is not None]
@@ -940,6 +994,7 @@ def main():
             for r in sample:
                 try:
                     data = download(s, r["image"], c)
+                    sample_sizes.append(len(data))
                     bad, msg, _ = validate_image(data, a.max_image_mb * 1024 * 1024)
                     ok += bad is None
                     log.info("pre-flight sample row %d: %s", r["row_number"], f"{bad}: {msg}" if bad else "OK")
@@ -947,6 +1002,17 @@ def main():
                     log.warning("pre-flight sample row %d: %s", r["row_number"], e)
             if ok == 0 and not confirm("WARNING: none of the sample images could be downloaded/decoded.", a.yes):
                 return 2
+    if a.save_images:
+        avg = (sum(sample_sizes) / len(sample_sizes)) if sample_sizes else ASSUMED_IMAGE_KB * 1024
+        need_mb = len(pending) * avg * 1.2 / 1048576 + MIN_FREE_DISK_MB
+        free_mb = shutil.disk_usage(out).free / 1048576
+        log.info("images: saving to %s | est. %.1f GB for %d images (avg %.0f KB%s) | disk free %.1f GB",
+                 out / "images", len(pending) * avg / 1073741824, len(pending), avg / 1024,
+                 "" if sample_sizes else ", assumed", free_mb / 1024)
+        if free_mb < need_mb and not confirm(
+                f"WARNING: estimated space needed ~{need_mb / 1024:.1f} GB but only {free_mb / 1024:.1f} GB free; "
+                f"the run will stop when free space drops below {DISK_STOP_MB} MB.", a.yes):
+            return 2
     if a.dry_run:
         log.info("Dry run complete — no API calls made.")
         return 0
@@ -960,6 +1026,12 @@ def main():
     ctx.result_q = queue.Queue()
     ctx.progress_stop = threading.Event()
     ctx.writer_error = None
+    ctx.fatal_lock = threading.Lock()
+    ctx.images_dir = out / "images"
+    if a.save_images:
+        ctx.images_dir.mkdir(exist_ok=True)
+        for leftover in ctx.images_dir.glob("*.part"):  # from a crash mid-write
+            leftover.unlink()
 
     interrupts = {"n": 0, "sig": None}
 
@@ -1022,7 +1094,7 @@ def main():
     total_rows = sum(counts.values()) if explicit else len(rows)
     summ = summary_lines(counts, total_rows, done, by_status, codes, elapsed)
     if ctx.writer_error:  # writer already sent its own alert
-        log.critical("Run stopped due to writer failure: %s. Fix it, then resume with the same command.",
+        log.critical("Run stopped: %s. Fix it, then resume with the same command.",
                      ctx.writer_error)
         return 3
     if stop.is_set():

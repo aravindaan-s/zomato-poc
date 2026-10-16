@@ -2,3 +2,8 @@ __pycache__/
 *.pyc
 .env
 .DS_Store
+
+# liveness batch runs: rider selfies, results, presigned URLs, credentials
+runs/
+*.csv
+.liveness_env

@@ -1,6 +1,6 @@
 # liveness_runner.py
 
-Batch runner for HyperVerge's **checkLiveness** API. It reads a CSV of rider selfies (S3 presigned URLs), sends each image to the API at a controlled, ramped rate, and records every response field in a CSV. It is built to run unattended on a VM for hours: it survives crashes, retries transient failures, and emails you when a batch finishes or stops.
+Batch runner for HyperVerge's **checkLiveness** API. It reads a CSV of rider selfies (S3 presigned URLs), sends each image to the API at a controlled, ramped rate, records every response field in a CSV, and keeps a local copy of every image for review. It is built to run unattended on a VM for hours: it survives crashes, retries transient failures, and emails you when a batch finishes or stops.
 
 - [How it works](#how-it-works)
 - [Setup (one time)](#setup-one-time)
@@ -8,6 +8,7 @@ Batch runner for HyperVerge's **checkLiveness** API. It reads a CSV of rider sel
 - [Running a batch](#running-a-batch)
 - [Rate limiting and ramp-up](#rate-limiting-and-ramp-up)
 - [Output files](#output-files)
+- [Saved images](#saved-images)
 - [Row statuses](#row-statuses)
 - [Resume and retries](#resume-and-retries)
 - [Email alerts](#email-alerts)
@@ -24,13 +25,14 @@ Batch runner for HyperVerge's **checkLiveness** API. It reads a CSV of rider sel
 input.csv ──► Reader ──bounded queue──► 8 worker threads ──► result queue ──► Writer thread
  (skips rows                              │                                    │
   already done)                           ├─ check URL expiry (from URL params) ├─ results.csv
-                                          ├─ download image from S3 (in memory) ├─ failures_log.csv
-                                          ├─ validate image (format + decode)   └─ run.log
+                                          ├─ download image from S3             ├─ failures_log.csv
+                                          ├─ save a copy to images/             └─ run.log
+                                          ├─ validate image (format + decode)
                                           ├─ wait for a rate-limiter slot
                                           └─ POST checkLiveness (retry + backoff)
 ```
 
-- **Images are never written to disk.** Each image is downloaded into memory and sent as the multipart `image` field.
+- **Every downloaded image is saved** to `images/` in the batch folder (see [Saved images](#saved-images)), then sent from memory as the multipart `image` field.
 - **`transactionId` = `riderId`** on every call. The API's `requestId` (unique per call) is recorded so any single call can be traced.
 - **One writer thread** owns all output files, so concurrent workers can never corrupt a CSV row. Every row is flushed to disk as soon as it is written.
 - **`results.csv` is the checkpoint.** On restart, rows already in it are skipped.
@@ -224,8 +226,9 @@ All in the `--out` folder (e.g. `runs/batch_01/`):
 | `failures_log.csv` | Append-only log of every failure, with image URL. |
 | `run.log` | Full log (same as the console). |
 | `manifest.json` | Input file path, SHA-256 and batch name, used to refuse unsafe resumes. |
+| `images/` | A copy of every downloaded image. See [Saved images](#saved-images). |
 
-### `results.csv` / `results_latest.csv` columns (50)
+### `results.csv` / `results_latest.csv` columns (51)
 
 **Run and row bookkeeping**
 
@@ -241,6 +244,7 @@ All in the `--out` folder (e.g. `runs/batch_01/`):
 | `attempts` | Number of API attempts made |
 | `api_latency_ms` | Latency of the final API attempt |
 | `image_bytes` | Downloaded image size |
+| `saved_image_path` | Path of the saved copy, relative to the batch folder (e.g. `images/001842_RDR12345.jpg`) |
 | `error_message` | Reason for any non-SUCCESS status |
 | `started_at`, `finished_at` | ISO timestamps |
 
@@ -257,6 +261,47 @@ All in the `--out` folder (e.g. `runs/batch_01/`):
 | `summary_action` | `result.summary.action` |
 | `summary_details` | `result.summary.details` as a JSON string (a variable-length list) |
 | `raw_response` | Full response body. Any field not mapped above, such as a new quality check, is preserved here; the log warns once if one appears. |
+
+---
+
+## Saved images
+
+Every image the script downloads is saved, whatever its outcome (SUCCESS, API_REJECTED, IMAGE_CORRUPT, …), in a flat folder:
+
+```
+runs/batch_01/images/
+├── 000001_RDR10001.jpg
+├── 000002_RDR10002.jpg
+├── 000031_RDR55102.heic
+└── 000034_RDR20391.bin
+```
+
+**Filename:** `<row_number>_<riderId>.<ext>`
+
+- `row_number` is zero-padded to 6 digits, so files sort in input order. It is unique within a batch, so duplicate riderIds never overwrite each other, and it matches `row_number` in the CSV.
+- Characters in `riderId` that aren't filename-safe become `_`. A blank riderId uses the first 8 characters of `row_uid` instead.
+- `ext` comes from the file's actual content (`jpg`, `png`, `webp`, `heic`, `avif`, `gif`, `bmp`, `tif`, `pdf`), or `bin` if unrecognisable.
+- Saved bytes are exactly what S3 returned; nothing is re-encoded.
+
+**Rows with no image file:** `URL_EMPTY`, `URL_EXPIRED`, `DOWNLOAD_FAILED`, and empty (0-byte) downloads. Their `saved_image_path` is blank.
+
+**Retries** overwrite the same file. Writes are atomic (written as `.part`, then renamed), so a crash never leaves a half-written image; stray `.part` files are removed on the next start.
+
+**Finding images by outcome:** filter `results_latest.csv` on `status` (or `summary_action`, `liveFace_value`, …) and use `saved_image_path`:
+
+```python
+import pandas as pd, shutil, os
+df = pd.read_csv("runs/batch_01/results_latest.csv", dtype=str)
+os.makedirs("review/rejected", exist_ok=True)
+for p in df[df.status == "API_REJECTED"].saved_image_path.dropna():
+    shutil.copy(f"runs/batch_01/{p}", "review/rejected/")
+```
+
+**Disk space.** At ~300 KB per selfie, one 20k batch is about **6 GB**, and all five about **30 GB**. At startup the script estimates the space needed from the pre-flight sample images and asks for confirmation if there isn't enough. During the run it stops cleanly (and emails you) if free space drops below 200 MB, before the disk is actually full. The progress line shows free space. Check before batch 1 with `df -h ~`.
+
+**Turning it off:** add `--no-save-images` to a run.
+
+**These are rider selfies, and unlike presigned URLs they don't expire.** Keep `runs/` permission-restricted (`chmod -R go-rwx ~/liveness/runs`), copy off only what you need for review, and delete `images/` once a batch is closed out.
 
 ---
 
@@ -282,7 +327,7 @@ Accepted image formats: JPEG, PNG, WEBP. Retries happen inside a run, with expon
 
 ### After a crash or stop
 
-Run the **exact same command** again. Rows already in `results.csv` are skipped, a half-written last line left by a crash is cleaned up automatically, and the ramp starts again from 20 RPM.
+Run the **exact same command** again. Rows already in `results.csv` are skipped, a half-written last line or image left by a crash is cleaned up automatically, and the ramp starts again from 20 RPM.
 
 ### Re-run transient failures
 
@@ -320,7 +365,7 @@ All alerts go **To** `s.aravindaan@gmail.com`, **CC** `aravindaan.s@hyperverge.c
 | Stopped with Ctrl-C | `STOPPED MANUALLY (Ctrl-C): batch_01` | Totals so far, resume command |
 | SIGTERM (system or `kill`) | `STOPPED (SIGTERM): batch_01` | Totals so far, resume command |
 | SSH dropped outside tmux | `STOPPED (SIGHUP): batch_01` | Totals so far, resume command |
-| Writer failure (disk full etc.) | `STOPPED: cannot write results (...)` | Error, rows written; run stops immediately |
+| Disk failure: results or an image can't be written, or free space < 200 MB | `STOPPED: cannot write to disk: batch_01` | Error, free space, rows written; run stops immediately |
 | Unexpected error | `CRASHED: batch_01 — <ErrorType>` | Full traceback, command |
 
 Not covered: a double Ctrl-C (force quit), `kill -9`, or the VM losing power. The process can't send mail in those cases.
@@ -358,7 +403,8 @@ Optional `SMTP_FROM` overrides the sender address. Port 465 uses SSL; other port
 | `--api-timeout` | 60 | API read timeout, seconds |
 | `--download-retries` | 3 | S3 download attempts |
 | `--download-timeout` | 30 | S3 read timeout, seconds |
-| `--max-image-mb` | 10 | Larger images → `UNSUPPORTED_FORMAT` |
+| `--max-image-mb` | 10 | Larger images → `UNSUPPORTED_FORMAT` (still saved) |
+| `--no-save-images` | off | Don't save images to `images/` |
 | `--retry-failed` | off | Also re-run rows whose latest status is retriable |
 | `--limit N` | — | Process at most N pending rows (smoke tests) |
 | `--progress-every` | 30 | Seconds between progress lines |
@@ -380,7 +426,7 @@ Environment variables: `HV_APP_ID`, `HV_APP_KEY` (required), `SMTP_HOST`, `SMTP_
 | 0 | Finished (or nothing left to do) |
 | 1 | Crashed on an unexpected error (alert sent), or `--test-alert` failed |
 | 2 | Aborted at pre-flight (warning not confirmed) |
-| 3 | Writer failure; results could not be written (alert sent) |
+| 3 | Disk/write failure: results or images could not be written, or disk nearly full (alert sent) |
 | 130 | Stopped by Ctrl-C / SIGTERM / SIGHUP; resume with the same command |
 
 ---
@@ -394,6 +440,8 @@ Environment variables: `HV_APP_ID`, `HV_APP_KEY` (required), `SMTP_HOST`, `SMTP_
 | `ensurepip is not available` when creating the venv | `sudo apt install python3.X-venv`, then `rm -rf venv` and recreate. |
 | `Input file differs from the one this output folder was started with` | The CSV changed after the batch started. Use the original file, or a new `--out` folder. |
 | `Only N MB free` | Free at least 500 MB of disk. |
+| `estimated space needed ~X GB but only Y GB free` | Free space, delete `images/` from finished batches, or run with `--no-save-images`. |
+| `... was written by a different version of this script (columns differ)` | The output folder was created by an older version. Use a new `--out` folder. |
 | `alerts: no SMTP_HOST and no sendmail found` | SMTP env vars not loaded; alerts won't be sent. |
 | `ALERT NOT SENT ... SMTPAuthenticationError` | Wrong app password, or 2-Step Verification is off. |
 | Many `URL_EXPIRED` near the end of a batch | URLs were generated too long before the run started. Regenerate them and use the retry-file flow. |
@@ -405,9 +453,9 @@ Environment variables: `HV_APP_ID`, `HV_APP_KEY` (required), `SMTP_HOST`, `SMTP_
 ## Operational notes
 
 - **One batch at a time.** The RPM limit is per process; two concurrent runs would share the 100 RPM.
-- **Don't change the script mid-batch.** `results.csv` is append-only; a version with different columns would misalign rows. Upgrade between batches.
+- **Don't change the script mid-batch.** `results.csv` is append-only; the script refuses to append to a `results.csv` whose columns don't match its own. Upgrade between batches.
 - **Duplicate API calls are possible but rare.** A call that times out after the server processed it, or a crash mid-call, is sent again on retry or resume. `requestId` identifies duplicates if billing reconciliation is needed.
-- **The output folder contains live presigned URLs** (`failures.csv`, `failures_log.csv`) to rider selfies, valid until expiry. Keep `runs/` permission-restricted and delete those files once a batch is closed out.
+- **The output folder contains rider selfies** (`images/`) and live presigned URLs (`failures.csv`, `failures_log.csv`). Keep `runs/` permission-restricted and delete both once a batch is closed out.
 - **Opening in Excel** can mangle long numeric riderIds (scientific notation, dropped leading zeros). Import with columns as text, or use pandas or Google Sheets.
 - **Reading results in pandas:**
 
