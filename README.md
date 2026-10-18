@@ -33,17 +33,19 @@ input.csv ──► Reader ──bounded queue──► 8 worker threads ──�
 ```
 
 - **Every downloaded image is saved** to `images/` in the batch folder (see [Saved images](#saved-images)), then sent from memory as the multipart `image` field.
-- **`transactionId` = `riderId`** on every call. The API's `requestId` (unique per call) is recorded so any single call can be traced.
+- **`transactionId` = `driver_id`** on every call. The API's `requestId` (unique per call) is recorded so any single call can be traced.
+- **Every input column is copied as-is** into the results, next to the API response fields, so model predictions and liveness results sit side by side.
 - **One writer thread** owns all output files, so concurrent workers can never corrupt a CSV row. Every row is flushed to disk as soon as it is written.
 - **`results.csv` is the checkpoint.** On restart, rows already in it are skipped.
-- **Each input row gets a stable `row_uid`** (UUIDv5 of batch name + row number + riderId). Duplicate riderIds are processed as separate rows, and the same row always gets the same `row_uid` across restarts.
+- **Each input row gets a stable `row_uid`** (UUIDv5 of batch name + row number + driver_id). Duplicate driver_ids are processed as separate rows, and the same row always gets the same `row_uid` across restarts.
 
 Request form fields sent with every call (constants at the top of the script):
 
 | Field | Value |
 |---|---|
 | `returnCroppedImageURL` | `no` |
-| `qualityChecks.eyesClosed` | `yes` |
+| `qualityChecks.eyesClosed`, `.blur`, `.hat`, `.multipleFaces`, `.sunglasses`, `.readingGlasses`, `.headTurned`, `.eyewear`, `.occlusion` | `yes` |
+| `preferences.returnScore`, `preferences.returnConfidence` | `yes` |
 
 ---
 
@@ -124,20 +126,22 @@ Confirm the test email arrived in **all three** inboxes (check spam on the Hyper
 
 ## Input format
 
-A CSV with a header row containing at least:
+A CSV with a header row. Expected columns:
 
-| Column | Description |
+| Column | Used for |
 |---|---|
-| `riderId` | String. Used as the API `transactionId`. Duplicates are allowed. |
-| `image` | S3 presigned URL (SigV4 or SigV2). |
+| `driver_id` | **Required.** Sent as the API `transactionId`; also used in image filenames. Duplicates are allowed. |
+| `presigned_url` | **Required.** S3 presigned URL (SigV4 or SigV2) the image is downloaded from. |
+| `v7_prediction`, `v8_prediction`, `llm_prediction`, `hyperverge_prediction`, `selfie_url`, `created_at`, `selfies` | Not used by the script; copied as-is to the results. |
 
 ```csv
-riderId,image
-RDR12345,https://bucket.s3.ap-south-1.amazonaws.com/selfies/a.jpg?X-Amz-Algorithm=...&X-Amz-Date=20261016T100000Z&X-Amz-Expires=21600&...
-RDR12346,https://...
+driver_id,v7_prediction,v8_prediction,llm_prediction,hyperverge_prediction,selfie_url,presigned_url,created_at,selfies
+D10001,live,live,live,pass,s3://bucket/selfies/D10001.jpg,https://bucket.s3.ap-south-1.amazonaws.com/selfies/D10001.jpg?X-Amz-Algorithm=...&X-Amz-Date=20261017T100000Z&X-Amz-Expires=21600&...,2026-10-01 10:00:00,...
 ```
 
-- Extra columns are ignored.
+- **Every column in the input is copied unchanged** into the results CSV, in the same order, so any column (present or added later) flows through. Only `driver_id` and `presigned_url` are required.
+- If the column names differ, point the script at them with `--id-col` and `--image-col`.
+- If an input column has the same name as one of the script's own columns (e.g. `status`), it is written as `input_<name>`.
 - A UTF-8 BOM (as Excel writes) is handled.
 - **Do not edit an input CSV once its batch has started.** `row_uid` depends on row position; the script refuses to resume if the file's hash has changed (see [`--force`](#cli-reference)).
 - A CSV that also has `row_uid` (and `row_number`) columns, such as an edited `failures.csv`, is treated as a **retry file**: the given `row_uid`s are used as-is. See [Resume and retries](#resume-and-retries).
@@ -228,23 +232,30 @@ All in the `--out` folder (e.g. `runs/batch_01/`):
 | `manifest.json` | Input file path, SHA-256 and batch name, used to refuse unsafe resumes. |
 | `images/` | A copy of every downloaded image. See [Saved images](#saved-images). |
 
-### `results.csv` / `results_latest.csv` columns (51)
+### `results.csv` / `results_latest.csv` columns (59 with the current input)
 
-**Run and row bookkeeping**
+Order: bookkeeping → **all input columns as-is** → script fields → API response fields.
+
+**Bookkeeping and input**
 
 | Column | Description |
 |---|---|
 | `run_id` | Timestamp ID of the run that produced the row |
 | `row_uid` | Stable unique ID for the input row |
 | `row_number` | 1-based position in the input CSV |
-| `riderId` | From input |
-| `transactionId` | Sent to the API (= riderId; falls back to row_uid if riderId is blank) |
+| `driver_id` … `selfies` | Every input column, unchanged, in input order |
+
+**Script fields**
+
+| Column | Description |
+|---|---|
+| `transactionId` | Sent to the API (= driver_id; falls back to row_uid if driver_id is blank) |
 | `status` | See [Row statuses](#row-statuses) |
 | `http_status` | HTTP code of the final API attempt |
 | `attempts` | Number of API attempts made |
 | `api_latency_ms` | Latency of the final API attempt |
 | `image_bytes` | Downloaded image size |
-| `saved_image_path` | Path of the saved copy, relative to the batch folder (e.g. `images/001842_RDR12345.jpg`) |
+| `saved_image_path` | Path of the saved copy, relative to the batch folder (e.g. `images/001842_D10001.jpg`) |
 | `error_message` | Reason for any non-SUCCESS status |
 | `started_at`, `finished_at` | ISO timestamps |
 
@@ -270,16 +281,16 @@ Every image the script downloads is saved, whatever its outcome (SUCCESS, API_RE
 
 ```
 runs/batch_01/images/
-├── 000001_RDR10001.jpg
-├── 000002_RDR10002.jpg
-├── 000031_RDR55102.heic
-└── 000034_RDR20391.bin
+├── 000001_D10001.jpg
+├── 000002_D10002.jpg
+├── 000031_D10031.heic
+└── 000034_D10034.bin
 ```
 
-**Filename:** `<row_number>_<riderId>.<ext>`
+**Filename:** `<row_number>_<driver_id>.<ext>`
 
-- `row_number` is zero-padded to 6 digits, so files sort in input order. It is unique within a batch, so duplicate riderIds never overwrite each other, and it matches `row_number` in the CSV.
-- Characters in `riderId` that aren't filename-safe become `_`. A blank riderId uses the first 8 characters of `row_uid` instead.
+- `row_number` is zero-padded to 6 digits, so files sort in input order. It is unique within a batch, so duplicate driver_ids never overwrite each other, and it matches `row_number` in the CSV.
+- Characters in `driver_id` that aren't filename-safe become `_`. A blank driver_id uses the first 8 characters of `row_uid` instead.
 - `ext` comes from the file's actual content (`jpg`, `png`, `webp`, `heic`, `avif`, `gif`, `bmp`, `tif`, `pdf`), or `bin` if unrecognisable.
 - Saved bytes are exactly what S3 returned; nothing is re-encoded.
 
@@ -313,7 +324,7 @@ for p in df[df.status == "API_REJECTED"].saved_image_path.dropna():
 | `API_REJECTED` | API processed the image and rejected it: HTTP 4xx other than 429 (e.g. "Face not detected"). **A valid model outcome, not a script failure.** | No |
 | `API_ERROR` | Unexpected API response: 200 with non-success status, or an unexpected code | No |
 | `RETRIES_EXHAUSTED` | 429 / 5xx / timeout / connection error on all attempts (default 6) | **Yes** |
-| `URL_EMPTY` | `image` column blank | No |
+| `URL_EMPTY` | `presigned_url` blank | No |
 | `URL_EXPIRED` | Presigned URL past its expiry (read from the URL, no download attempted), or S3 said "Request has expired" | Yes, but only helps with fresh URLs (see below) |
 | `DOWNLOAD_FAILED` | S3 timeout / 5xx after 3 tries, **or** S3 404 / 403 / 400 | Yes, but only timeouts and 5xx will succeed |
 | `IMAGE_CORRUPT` | Empty file, unrecognisable bytes (e.g. an XML/HTML error page), or a JPEG/PNG/WEBP that fails to decode (truncated, damaged) | No |
@@ -340,7 +351,7 @@ Re-runs rows whose latest status is `RETRIES_EXHAUSTED`, `DOWNLOAD_FAILED` or `U
 ### Re-run rows with regenerated URLs
 
 1. Copy `runs/batch_01/failures.csv`.
-2. Replace the `image` column with fresh presigned URLs. **Keep `row_uid` and `row_number` unchanged.**
+2. Replace the `presigned_url` column with fresh presigned URLs. **Keep `row_uid` and `row_number` unchanged**, and don't add or remove columns. `failures.csv` already contains every original input column, so the results stay complete.
 3. Feed it back into the **same** output folder:
 
 ```bash
@@ -389,8 +400,10 @@ Optional `SMTP_FROM` overrides the sender address. Port 465 uses SSL; other port
 |---|---|---|
 | `--input` | required | Input CSV |
 | `--out` | required | Output folder for this batch |
+| `--id-col` | `driver_id` | Column sent as `transactionId` |
+| `--image-col` | `presigned_url` | Column holding the presigned image URL |
 | `--batch-name` | input file name | Part of `row_uid`; keep it the same across resumes |
-| `--api-url` | `https://global.rl.hyperverge.co/v1/checkLiveness` | API endpoint |
+| `--api-url` | `https://ind.idv.hyperverge.co/v1/checkLiveness` | API endpoint |
 | `--workers` | 8 | Worker threads |
 | `--start-rpm` | 20 | Ramp starting rate |
 | `--step-rpm` | 15 | RPM added per step |
@@ -456,7 +469,7 @@ Environment variables: `HV_APP_ID`, `HV_APP_KEY` (required), `SMTP_HOST`, `SMTP_
 - **Don't change the script mid-batch.** `results.csv` is append-only; the script refuses to append to a `results.csv` whose columns don't match its own. Upgrade between batches.
 - **Duplicate API calls are possible but rare.** A call that times out after the server processed it, or a crash mid-call, is sent again on retry or resume. `requestId` identifies duplicates if billing reconciliation is needed.
 - **The output folder contains rider selfies** (`images/`) and live presigned URLs (`failures.csv`, `failures_log.csv`). Keep `runs/` permission-restricted and delete both once a batch is closed out.
-- **Opening in Excel** can mangle long numeric riderIds (scientific notation, dropped leading zeros). Import with columns as text, or use pandas or Google Sheets.
+- **Opening in Excel** can mangle long numeric driver_ids (scientific notation, dropped leading zeros). Import with columns as text, or use pandas or Google Sheets.
 - **Reading results in pandas:**
 
 ```python
@@ -464,4 +477,6 @@ import pandas as pd
 df = pd.read_csv("runs/batch_01/results_latest.csv", dtype=str)
 df["status"].value_counts()
 df[df.status == "SUCCESS"]["liveFace_value"].value_counts()
+# compare with the existing model predictions
+pd.crosstab(df["v8_prediction"], df["liveFace_value"])
 ```

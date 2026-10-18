@@ -2,9 +2,10 @@
 """
 liveness_runner.py — batch runner for HyperVerge checkLiveness.
 
-Reads a CSV with columns `riderId,image` (image = S3 presigned URL), downloads each
-image into memory, sends it to checkLiveness with transactionId = riderId, and writes
-every response field to CSV. One run = one batch file.
+Reads a CSV with a `driver_id` column and a `presigned_url` column (S3 presigned URL),
+downloads each image, sends it to checkLiveness with transactionId = driver_id, and writes
+every input column (copied as-is) plus every response field to CSV. One run = one batch file.
+Column names are configurable with --id-col / --image-col.
 
 USAGE
     export HV_APP_ID=xxxx
@@ -14,7 +15,7 @@ USAGE
     # resume after a crash / Ctrl-C: run the exact same command again
     # re-run only retriable failures (timeouts, 5xx/429 exhausted, download errors):
     python3 liveness_runner.py --input batch_01.csv --out runs/batch_01 --retry-failed
-    # re-run rows with regenerated URLs: edit the `image` column of
+    # re-run rows with regenerated URLs: edit the `presigned_url` column of
     # runs/batch_01/failures.csv (keep row_uid) and feed it back in:
     python3 liveness_runner.py --input fixed_failures.csv --out runs/batch_01
 
@@ -25,7 +26,7 @@ OUTPUTS (in --out)
     failures_log.csv    append-only log of every failure (with image URL)
     run.log             full log
     manifest.json       input file fingerprint, used to refuse unsafe resumes
-    images/             every downloaded image, named <row_number>_<riderId>.<ext>
+    images/             every downloaded image, named <row_number>_<driver_id>.<ext>
                         (disable with --no-save-images)
 
 ALERTS (emailed to ALERT_EMAIL_TO, CC ALERT_EMAIL_CC — defaults below)
@@ -97,7 +98,7 @@ except ImportError:  # pragma: no cover
 
 # --------------------------------------------------------------------------- config
 
-DEFAULT_API_URL = "https://global.rl.hyperverge.co/v1/checkLiveness"
+DEFAULT_API_URL = "https://ind.idv.hyperverge.co/v1/checkLiveness"
 ALERT_EMAIL_TO = os.environ.get("ALERT_EMAIL_TO", "s.aravindaan@gmail.com")
 ALERT_EMAIL_CC = os.environ.get("ALERT_EMAIL_CC", "aravindaan.s@hyperverge.co, eshaan.j@hyperverge.co")
 ALERT_RECIPIENTS = ", ".join(x for x in (ALERT_EMAIL_TO, ALERT_EMAIL_CC) if x)
@@ -107,6 +108,16 @@ ASSUMED_IMAGE_KB = 400   # used for the disk estimate when no sample was downloa
 FORM_FIELDS = {
     "returnCroppedImageURL": "no",
     "qualityChecks.eyesClosed": "yes",
+    "qualityChecks.blur": "yes",
+    "qualityChecks.hat": "yes",
+    "qualityChecks.multipleFaces": "yes",
+    "qualityChecks.sunglasses": "yes",
+    "qualityChecks.readingGlasses": "yes",
+    "qualityChecks.headTurned": "yes",
+    "qualityChecks.eyewear": "yes",
+    "qualityChecks.occlusion": "yes",
+    "preferences.returnScore": "yes",
+    "preferences.returnConfidence": "yes",
 }
 # Fixed namespace so row_uid is stable across runs/restarts. Do not change mid-project.
 UID_NAMESPACE = uuid.UUID("6f1c2b7e-3d4a-4e8b-9c1d-2a5b7e9f0c13")
@@ -117,8 +128,11 @@ QUALITY_CHECKS = [
 ]
 QC_FIELDS = ["value", "score", "confidence"]
 
+DEFAULT_ID_COL = "driver_id"
+DEFAULT_IMAGE_COL = "presigned_url"
+LEAD_COLS = ["run_id", "row_uid", "row_number"]
 BASE_COLS = [
-    "run_id", "row_uid", "row_number", "riderId", "transactionId", "status",
+    "transactionId", "status",
     "http_status", "attempts", "api_latency_ms", "image_bytes", "saved_image_path", "error_message",
     "started_at", "finished_at",
 ]
@@ -128,8 +142,24 @@ RESPONSE_COLS = (
     + [f"qc_{c}_{f}" for c in QUALITY_CHECKS for f in QC_FIELDS]
     + ["summary_action", "summary_details", "raw_response"]
 )
-RESULT_COLS = BASE_COLS + RESPONSE_COLS
-FAILURE_COLS = ["row_uid", "row_number", "riderId", "image", "status", "error_message", "finished_at"]
+SCRIPT_COLS = set(LEAD_COLS) | set(BASE_COLS) | set(RESPONSE_COLS)
+FAILURE_EXTRA = ["status", "error_message", "finished_at"]
+RETRY_META = {"row_uid", "row_number"} | set(FAILURE_EXTRA)
+
+# Set by configure_columns() once the input header is known.
+INPUT_MAP = []      # [(input column name, output column name)]
+RESULT_COLS = []    # run_id,row_uid,row_number, <input columns as-is>, script + API response columns
+FAILURE_COLS = []   # row_uid,row_number, <input columns as-is>, status,error_message,finished_at
+
+
+def configure_columns(input_cols):
+    """Input columns are copied through unchanged; a name that clashes with a script column
+    is written as input_<name>."""
+    global INPUT_MAP, RESULT_COLS, FAILURE_COLS
+    INPUT_MAP = [(c, f"input_{c}" if c in SCRIPT_COLS else c) for c in input_cols]
+    outs = [o for _, o in INPUT_MAP]
+    RESULT_COLS = LEAD_COLS + outs + BASE_COLS + RESPONSE_COLS
+    FAILURE_COLS = ["row_uid", "row_number"] + outs + FAILURE_EXTRA
 
 SUCCESS = "SUCCESS"
 API_REJECTED = "API_REJECTED"
@@ -299,26 +329,32 @@ def file_sha256(path):
     return h.hexdigest()
 
 
-def read_input(path, batch_name):
+def read_input(path, batch_name, id_col, img_col):
     with open(path, newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         fields = [c.strip() for c in (reader.fieldnames or [])]
         reader.fieldnames = fields
-        missing = {"riderId", "image"} - set(fields)
+        missing = [c for c in (id_col, img_col) if c not in fields]
         if missing:
-            raise SystemExit(f"Input CSV is missing column(s): {', '.join(sorted(missing))}. Found: {fields}")
+            raise SystemExit(f"Input CSV is missing column(s): {', '.join(missing)}. Found: {fields}. "
+                             f"(Use --id-col / --image-col if the names differ.)")
         explicit = "row_uid" in fields
+        # in a retry file (an edited failures.csv) the bookkeeping columns are not input data
+        input_cols = [c for c in fields if not (explicit and c in RETRY_META)]
+        configure_columns(input_cols)
         rows = []
         for i, row in enumerate(reader, start=1):
-            rider = (row.get("riderId") or "").strip()
-            img = (row.get("image") or "").strip()
+            rider = (row.get(id_col) or "").strip()
+            img = (row.get(img_col) or "").strip()
             if explicit and (row.get("row_uid") or "").strip():
                 uid = row["row_uid"].strip()
                 rn = int(row.get("row_number") or i)
             else:
                 uid = str(uuid.uuid5(UID_NAMESPACE, f"{batch_name}:{i}:{rider}"))
                 rn = i
-            rows.append({"row_uid": uid, "row_number": rn, "riderId": rider, "image": img})
+            passthrough = {out: ("" if row.get(c) is None else row.get(c)) for c, out in INPUT_MAP}
+            rows.append({"row_uid": uid, "row_number": rn, "_id": rider, "image": img,
+                         "input": passthrough})
     return rows, explicit
 
 
@@ -452,7 +488,7 @@ def save_image(ctx, item, data):
     Returns the path relative to the output folder."""
     fmt = sniff_format(data)
     ext = SAVE_EXT.get(fmt[0], "bin") if fmt else "bin"
-    rider = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in item["riderId"])[:80]
+    rider = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in item["_id"])[:80]
     name = f"{int(item['row_number']):06d}_{rider or item['row_uid'][:8]}.{ext}"
     final = ctx.images_dir / name
     tmp = final.with_name(final.name + ".part")
@@ -504,7 +540,7 @@ def flatten(body):
 def call_api(session, item, data, ext, mime, ctx):
     """Returns (status, partial_row). Raises Aborted on shutdown."""
     a = ctx.args
-    txn = item["riderId"] or item["row_uid"]
+    txn = item["_id"] or item["row_uid"]
     headers = {"appId": ctx.app_id, "appKey": ctx.app_key, "transactionId": txn}
     safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in txn)[:80] or "image"
     files = {"image": (f"{safe}.{ext}", data, mime)}
@@ -565,8 +601,9 @@ def call_api(session, item, data, ext, mime, ctx):
 def process(item, session, ctx):
     base = {
         "run_id": ctx.run_id, "row_uid": item["row_uid"], "row_number": item["row_number"],
-        "riderId": item["riderId"], "transactionId": item["riderId"] or item["row_uid"],
-        "started_at": now_iso(), "_image": item["image"],
+        **item["input"],
+        "_id": item["_id"], "transactionId": item["_id"] or item["row_uid"],
+        "started_at": now_iso(),
     }
 
     def done(status, extra):
@@ -618,9 +655,10 @@ def worker_loop(ctx):
             log.exception("Unexpected error on row %s", item["row_number"])
             res = {
                 "run_id": ctx.run_id, "row_uid": item["row_uid"], "row_number": item["row_number"],
-                "riderId": item["riderId"], "transactionId": item["riderId"] or item["row_uid"],
+                **item["input"],
+                "_id": item["_id"], "transactionId": item["_id"] or item["row_uid"],
                 "status": RETRIES_EXHAUSTED, "error_message": f"unexpected: {type(e).__name__}: {e}",
-                "finished_at": now_iso(), "_image": item["image"],
+                "finished_at": now_iso(),
             }
         ctx.result_q.put(res)
 
@@ -753,9 +791,9 @@ def _writer_body(ctx):
             rw.writerow({k: ("" if res.get(k) is None else res.get(k)) for k in RESULT_COLS})
             rf.flush()
             if res["status"] != SUCCESS:
-                fw.writerow({**res, "image": res.get("_image", "")})
+                fw.writerow({k: ("" if res.get(k) is None else res.get(k)) for k in FAILURE_COLS})
                 ff.flush()
-                log.info("row %s rider=%s -> %s: %s", res["row_number"], res["riderId"],
+                log.info("row %s id=%s -> %s: %s", res["row_number"], res["_id"],
                          res["status"], str(res.get("error_message", ""))[:200])
             ctx.stats.record_result(res["status"])
             n += 1
@@ -799,18 +837,12 @@ def finalize(out):
         w = csv.DictWriter(f, fieldnames=RESULT_COLS, extrasaction="ignore")
         w.writeheader()
         w.writerows(rows)
-    images = {}
-    fp = out / "failures_log.csv"
-    if fp.exists():
-        with open(fp, newline="", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                images[row["row_uid"]] = row.get("image", "")
     with open(out / "failures.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=FAILURE_COLS, extrasaction="ignore")
         w.writeheader()
         for r in rows:
             if r["status"] != SUCCESS:
-                w.writerow({**r, "image": images.get(r["row_uid"], "")})
+                w.writerow(r)
     return Counter(r["status"] for r in rows)
 
 
@@ -832,8 +864,11 @@ def confirm(prompt, assume_yes):
 def parse_args():
     p = argparse.ArgumentParser(description="Batch runner for HyperVerge checkLiveness",
                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument("--input", required="--test-alert" not in sys.argv, help="CSV with riderId,image (optionally row_uid,row_number)")
+    p.add_argument("--input", required="--test-alert" not in sys.argv,
+                   help="input CSV (all columns are copied to the results)")
     p.add_argument("--out", required="--test-alert" not in sys.argv, help="output directory for this batch")
+    p.add_argument("--id-col", default=DEFAULT_ID_COL, help="column used as transactionId")
+    p.add_argument("--image-col", default=DEFAULT_IMAGE_COL, help="column holding the presigned image URL")
     p.add_argument("--batch-name", help="defaults to input file name; part of row_uid")
     p.add_argument("--api-url", default=DEFAULT_API_URL)
     p.add_argument("--workers", type=int, default=8)
@@ -914,7 +949,9 @@ def main():
     if not HAVE_PIL:
         log.warning("Pillow not installed — only file-signature checks for corrupt images (pip install pillow).")
 
-    rows, explicit = read_input(inp, batch_name)
+    rows, explicit = read_input(inp, batch_name, a.id_col, a.image_col)
+    log.info("columns: transactionId <- '%s', image <- '%s' | %d input columns copied to results",
+             a.id_col, a.image_col, len(INPUT_MAP))
 
     # input fingerprint guard (row_uid depends on row positions)
     mpath = out / "manifest.json"
@@ -938,8 +975,8 @@ def main():
         with open(rpath, newline="", encoding="utf-8") as f:
             header = next(csv.reader(f), [])
         if header != RESULT_COLS:
-            raise SystemExit(f"{rpath} was written by a different version of this script (columns differ). "
-                             f"Use a new --out folder for this run.")
+            raise SystemExit(f"{rpath} has different columns from this run (written by another script "
+                             f"version, or the input CSV has different columns). Use a new --out folder.")
     repair_partial_line(rpath)
     repair_partial_line(out / "failures_log.csv")
     latest = load_latest(rpath)
@@ -953,9 +990,9 @@ def main():
     if a.limit:
         pending = pending[: a.limit]
 
-    dup = sum(c - 1 for c in Counter(r["riderId"] for r in rows).values() if c > 1)
-    log.info("rows in input: %d | already recorded: %d | to process now: %d | duplicate riderId rows: %d%s",
-             len(rows), len(latest), len(pending), dup, " | mode: retry" if retry_mode else "")
+    dup = sum(c - 1 for c in Counter(r["_id"] for r in rows).values() if c > 1)
+    log.info("rows in input: %d | already recorded: %d | to process now: %d | duplicate %s rows: %d%s",
+             len(rows), len(latest), len(pending), a.id_col, dup, " | mode: retry" if retry_mode else "")
     if not pending:
         counts = finalize(out)
         log.info("Nothing to do. Latest status counts: %s", dict(counts))
